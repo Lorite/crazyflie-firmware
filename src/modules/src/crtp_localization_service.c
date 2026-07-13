@@ -112,6 +112,11 @@ typedef struct {
 // in lock-step or external-pose fusion silently corrupts (issue #80).
 _Static_assert(sizeof(extPositionPackedItem) == 9, "extPositionPackedItem wire size drifted from crazyflie_cpp host packing (#80)");
 _Static_assert(sizeof(extPosePackedItem) == 13, "extPosePackedItem wire size drifted from crazyflie_cpp host packing (#80)");
+// Single-CF external packets must fit one CRTP packet (30 B data). EXT_POSE has a
+// leading type byte; EXT_POSITION does not. These guard against re-adding ageMs to
+// the full-pose struct, which would overflow (7 floats + type + ageMs = 31 B).
+_Static_assert(1 + sizeof(struct CrtpExtPose) <= CRTP_MAX_DATA_SIZE, "CrtpExtPose + type byte overflows a CRTP packet (#80)");
+_Static_assert(sizeof(struct CrtpExtPosition) <= CRTP_MAX_DATA_SIZE, "CrtpExtPosition overflows a CRTP packet (#80)");
 
 // Struct for logging position information
 static positionMeasurement_t ext_pos;
@@ -218,10 +223,11 @@ static void extPoseHandler(const CRTPPacket* pk) {
   ext_pose.quat.y = data->qy;
   ext_pose.quat.z = data->qz;
   ext_pose.quat.w = data->qw;
-  ext_pose.stdDevPos = locSrvInflateStd(extPosStdDev, extPoseAgeStdPos, data->ageMs);
-  ext_pose.stdDevQuat = locSrvInflateStd(extQuatStdDev, extPoseAgeStdQuat, data->ageMs);
-  ext_pose.captureAgeMs = data->ageMs;
-  extPoseLastAgeMs = data->ageMs;
+  // Single full-pose EXT_POSE carries no ageMs (CRTP size limit) — fuse at base
+  // trust. Age-aware pose uses the packed path. See issue #80.
+  ext_pose.stdDevPos = extPosStdDev;
+  ext_pose.stdDevQuat = extQuatStdDev;
+  ext_pose.captureAgeMs = 0;
 
   estimatorEnqueuePose(&ext_pose);
   tickOfLastPacket = xTaskGetTickCount();
