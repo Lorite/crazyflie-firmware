@@ -41,6 +41,7 @@ struct CrtpExtPosition
   float x; // in m
   float y; // in m
   float z; // in m
+  uint16_t ageMs; // measurement age (ms) at transmit; relative, clock-domain-invariant (issue #80)
 } __attribute__((packed));
 
 struct CrtpExtPose
@@ -52,6 +53,7 @@ struct CrtpExtPose
   float qy;
   float qz;
   float qw;
+  uint16_t ageMs; // measurement age (ms) at transmit; relative, clock-domain-invariant (issue #80)
 } __attribute__((packed));
 
 typedef enum
