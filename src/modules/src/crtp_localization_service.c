@@ -107,6 +107,12 @@ typedef struct {
   uint16_t ageMs; // measurement age (ms) at transmit; relative, clock-domain-invariant
 } __attribute__((packed)) extPosePackedItem;
 
+// Wire contract with the crazyswarm2 host packing (crazyflie_cpp crtp.h ::add()).
+// If these change, the host offsets in crtpExternalPose/PositionPacked must change
+// in lock-step or external-pose fusion silently corrupts (issue #80).
+_Static_assert(sizeof(extPositionPackedItem) == 9, "extPositionPackedItem wire size drifted from crazyflie_cpp host packing (#80)");
+_Static_assert(sizeof(extPosePackedItem) == 13, "extPosePackedItem wire size drifted from crazyflie_cpp host packing (#80)");
+
 // Struct for logging position information
 static positionMeasurement_t ext_pos;
 // Struct for logging pose information
