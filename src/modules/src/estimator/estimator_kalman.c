@@ -123,6 +123,10 @@ const uint32_t PREDICTION_UPDATE_INTERVAL_MS = 1000 / PREDICT_RATE;
 // The robust implementations use around 10% more CPU VS the standard flavours
 static bool robustTwr = false;
 static bool robustTdoa = false;
+// Plan (b), issue #80: forward-extrapolate delayed external (MOCAP) pose/position
+// measurements by v_world * age before fusing, to remove the latency bias. Default
+// off => behaviour identical to upstream; enable only after in-flight validation.
+static bool extPoseExtrapolate = false;
 
 /**
  * Quadrocopter State
@@ -287,6 +291,25 @@ void estimatorKalman(state_t *state, const stabilizerStep_t stabilizerStep) {
   xSemaphoreGive(runTaskSemaphore);
 }
 
+// Plan (b), issue #80: forward-predict a delayed external position/pose measurement
+// to "now" by adding v_world * age to it, so the EKF fuses it at (approximately) the
+// right place instead of at the reception-time state. Body-frame velocity is rotated
+// to world with coreData.R, exactly as the predict step does. Gated by
+// extPoseExtrapolate (default off) and a no-op when the age is 0 (unknown). The age
+// is clamped to 500 ms as a safety cap against a bogus timestamp injecting a jump.
+static void extrapolateExternalPos(float pos[3], uint16_t captureAgeMs) {
+  if (!extPoseExtrapolate || captureAgeMs == 0) {
+    return;
+  }
+  const float ageSec = (captureAgeMs > 500 ? 500.0f : (float)captureAgeMs) * 0.001f;
+  for (int i = 0; i < 3; i++) {
+    const float vWorld_i = coreData.R[i][0] * coreData.S[KC_STATE_PX]
+                         + coreData.R[i][1] * coreData.S[KC_STATE_PY]
+                         + coreData.R[i][2] * coreData.S[KC_STATE_PZ];
+    pos[i] += vWorld_i * ageSec;
+  }
+}
+
 static void updateQueuedMeasurements(const uint32_t nowMs, const bool quadIsFlying) {
   /**
    * Sensor measurements can come in sporadically and faster than the stabilizer loop frequency,
@@ -307,9 +330,11 @@ static void updateQueuedMeasurements(const uint32_t nowMs, const bool quadIsFlyi
         }
         break;
       case MeasurementTypePosition:
+        extrapolateExternalPos(m.data.position.pos, m.data.position.captureAgeMs);
         kalmanCoreUpdateWithPosition(&coreData, &m.data.position);
         break;
       case MeasurementTypePose:
+        extrapolateExternalPos(m.data.pose.pos, m.data.pose.captureAgeMs);
         kalmanCoreUpdateWithPose(&coreData, &m.data.pose);
         break;
       case MeasurementTypeDistance:
@@ -522,6 +547,11 @@ PARAM_GROUP_START(kalman)
  * @brief Nonzero to use robust TWR method (default: 0)
  */
   PARAM_ADD_CORE(PARAM_UINT8, robustTwr, &robustTwr)
+/**
+ * @brief Nonzero to forward-extrapolate delayed external (MOCAP) pose/position by
+ * v*age before fusing, using the age carried on the wire (issue #80). Default 0.
+ */
+  PARAM_ADD_CORE(PARAM_UINT8, extPoseExtrap, &extPoseExtrapolate)
 /**
  * @brief Process noise for x and y acceleration
  */
