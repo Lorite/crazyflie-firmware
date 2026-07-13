@@ -53,7 +53,9 @@ struct CrtpExtPose
   float qy;
   float qz;
   float qw;
-  uint16_t ageMs; // measurement age (ms) at transmit; relative, clock-domain-invariant (issue #80)
+  // NB: no ageMs here — the single full-pose EXT_POSE packet (7 floats + type
+  // byte = 29 B) has no room for it within CRTP_MAX_DATA_SIZE (30 B). Age-aware
+  // external pose goes through the packed path (extPosePackedItem). See issue #80.
 } __attribute__((packed));
 
 typedef enum
