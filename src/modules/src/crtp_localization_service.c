@@ -102,12 +102,13 @@ typedef struct {
   uint8_t group_id_and_bs_count; // 4 bits group id, 4 bits base station count
 } __attribute__((packed)) matchedAnglePacket;
 
-// up to 4 items per CRTP packet
+// up to 3 items per CRTP packet (was 4 before the ageMs field was added, see issue #80)
 typedef struct {
   uint8_t id; // last 8 bit of the Crazyflie address
   int16_t x; // mm
   int16_t y; // mm
   int16_t z; // mm
+  uint16_t ageMs; // measurement age (ms) at transmit; relative, clock-domain-invariant
 } __attribute__((packed)) extPositionPackedItem;
 
 // up to 2 items per CRTP packet
@@ -117,6 +118,7 @@ typedef struct {
   int16_t y; // mm
   int16_t z; // mm
   uint32_t quat; // compressed quaternion, see quatcompress.h
+  uint16_t ageMs; // measurement age (ms) at transmit; relative, clock-domain-invariant
 } __attribute__((packed)) extPosePackedItem;
 
 // Struct for logging position information
@@ -149,6 +151,13 @@ static paramVarId_t enLhMtchStmParamId;
 
 static float extPosStdDev = 0.01;
 static float extQuatStdDev = 4.5e-3;
+// Latency compensation (plan a, issue #80): inflate measurement stdDev as a
+// function of the measurement's age carried on the wire. Inflated stdDev =
+// base + gain * age_seconds. Gains default to 0 => feature is inert (behaviour
+// identical to upstream) until explicitly tuned.
+static float extPoseAgeStdPos = 0.0f;   // extra position stdDev per second of age [m/s]
+static float extPoseAgeStdQuat = 0.0f;  // extra quaternion stdDev per second of age [1/s]
+static uint16_t extPoseLastAgeMs = 0;   // age (ms) of the last external measurement, for logging/validation
 static bool isInit = false;
 static uint8_t my_id;
 static uint16_t tickOfLastPacket; // tick when last packet was received
@@ -199,14 +208,23 @@ static void updateLogFromExtPos()
   ext_pose.z = ext_pos.z;
 }
 
+// Age-based measurement-noise inflation for external-pose latency compensation
+// (plan a, issue #80). Returns base when gain is 0 (default) or ageMs is 0.
+static inline float locSrvInflateStd(float base, float gain, uint16_t ageMs)
+{
+  return base + gain * ((float)ageMs * 0.001f);
+}
+
 static void extPositionHandler(CRTPPacket* pk) {
   const struct CrtpExtPosition* data = (const struct CrtpExtPosition*)pk->data;
 
   ext_pos.x = data->x;
   ext_pos.y = data->y;
   ext_pos.z = data->z;
-  ext_pos.stdDev = extPosStdDev;
+  ext_pos.stdDev = locSrvInflateStd(extPosStdDev, extPoseAgeStdPos, data->ageMs);
+  ext_pos.captureAgeMs = data->ageMs;
   ext_pos.source = MeasurementSourceLocationService;
+  extPoseLastAgeMs = data->ageMs;
   updateLogFromExtPos();
 
   estimatorEnqueuePosition(&ext_pos);
@@ -223,8 +241,10 @@ static void extPoseHandler(const CRTPPacket* pk) {
   ext_pose.quat.y = data->qy;
   ext_pose.quat.z = data->qz;
   ext_pose.quat.w = data->qw;
-  ext_pose.stdDevPos = extPosStdDev;
-  ext_pose.stdDevQuat = extQuatStdDev;
+  ext_pose.stdDevPos = locSrvInflateStd(extPosStdDev, extPoseAgeStdPos, data->ageMs);
+  ext_pose.stdDevQuat = locSrvInflateStd(extQuatStdDev, extPoseAgeStdQuat, data->ageMs);
+  ext_pose.captureAgeMs = data->ageMs;
+  extPoseLastAgeMs = data->ageMs;
 
   estimatorEnqueuePose(&ext_pose);
   tickOfLastPacket = xTaskGetTickCount();
@@ -239,15 +259,18 @@ static void extPosePackedHandler(const CRTPPacket* pk) {
       ext_pose.y = item->y / 1000.0f;
       ext_pose.z = item->z / 1000.0f;
       quatdecompress(item->quat, (float *)&ext_pose.quat.q0);
-      ext_pose.stdDevPos = extPosStdDev;
-      ext_pose.stdDevQuat = extQuatStdDev;
+      ext_pose.stdDevPos = locSrvInflateStd(extPosStdDev, extPoseAgeStdPos, item->ageMs);
+      ext_pose.stdDevQuat = locSrvInflateStd(extQuatStdDev, extPoseAgeStdQuat, item->ageMs);
+      ext_pose.captureAgeMs = item->ageMs;
+      extPoseLastAgeMs = item->ageMs;
       estimatorEnqueuePose(&ext_pose);
       tickOfLastPacket = xTaskGetTickCount();
     } else {
       ext_pos.x = item->x / 1000.0f;
       ext_pos.y = item->y / 1000.0f;
       ext_pos.z = item->z / 1000.0f;
-      ext_pos.stdDev = extPosStdDev;
+      ext_pos.stdDev = locSrvInflateStd(extPosStdDev, extPoseAgeStdPos, item->ageMs);
+      ext_pos.captureAgeMs = item->ageMs;
       peerLocalizationTellPosition(item->id, &ext_pos);
     }
   }
@@ -355,9 +378,11 @@ static void extPositionPackedHandler(CRTPPacket* pk)
     ext_pos.x = item->x / 1000.0f;
     ext_pos.y = item->y / 1000.0f;
     ext_pos.z = item->z / 1000.0f;
-    ext_pos.stdDev = extPosStdDev;
+    ext_pos.stdDev = locSrvInflateStd(extPosStdDev, extPoseAgeStdPos, item->ageMs);
+    ext_pos.captureAgeMs = item->ageMs;
     ext_pos.source = MeasurementSourceLocationService;
     if (item->id == my_id) {
+      extPoseLastAgeMs = item->ageMs;
       updateLogFromExtPos();
       estimatorEnqueuePosition(&ext_pos);
       tickOfLastPacket = xTaskGetTickCount();
@@ -543,6 +568,10 @@ LOG_GROUP_START(locSrv)
  * @brief Quaternion w meas from an external system
  */
   LOG_ADD_CORE(LOG_FLOAT, qw, &ext_pose.quat.w)
+/**
+ * @brief Age (ms) of the last external measurement, as carried on the wire (issue #80)
+ */
+  LOG_ADD_CORE(LOG_UINT16, ageMs, &extPoseLastAgeMs)
 LOG_GROUP_STOP(locSrv)
 
 /**
@@ -600,4 +629,14 @@ PARAM_GROUP_START(locSrv)
  * @brief Standard deviation of the quarternion data to kalman filter
  */
   PARAM_ADD_CORE(PARAM_FLOAT, extQuatStdDev, &extQuatStdDev)
+/**
+ * @brief Extra position stdDev added per second of external-measurement age [m/s].
+ * Latency compensation (plan a, issue #80). 0 (default) = inert.
+ */
+  PARAM_ADD_CORE(PARAM_FLOAT, extPoseAgeStdPos, &extPoseAgeStdPos)
+/**
+ * @brief Extra quaternion stdDev added per second of external-measurement age [1/s].
+ * Latency compensation (plan a, issue #80). 0 (default) = inert.
+ */
+  PARAM_ADD_CORE(PARAM_FLOAT, extPoseAgeStdQuat, &extPoseAgeStdQuat)
 PARAM_GROUP_STOP(locSrv)

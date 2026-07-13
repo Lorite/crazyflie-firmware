@@ -127,6 +127,7 @@ typedef struct positionMeasurement_s {
   };
   float stdDev;
   measurementSource_t source;
+  uint16_t captureAgeMs;  // measurement age (ms) at CRTP transmit; relative/clock-domain-invariant. 0 = unknown. See issue #80.
 } positionMeasurement_t;
 
 typedef struct poseMeasurement_s {
@@ -141,6 +142,7 @@ typedef struct poseMeasurement_s {
   quaternion_t quat;
   float stdDevPos;
   float stdDevQuat;
+  uint16_t captureAgeMs;  // measurement age (ms) at CRTP transmit; relative/clock-domain-invariant. 0 = unknown. See issue #80.
 } poseMeasurement_t;
 
 typedef struct distanceMeasurement_s {
