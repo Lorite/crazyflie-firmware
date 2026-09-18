@@ -58,6 +58,9 @@
  * 2021.03.15, Wolfgang Hoenig: Refactored queue handling
  */
 
+#include <math.h>
+
+#include "ext_pose_history.h"
 #include "kalman_core.h"
 #include "kalman_core_params_defaults.h"
 #include "kalman_supervisor.h"
@@ -127,10 +130,34 @@ const uint32_t PREDICTION_UPDATE_INTERVAL_MS = 1000 / PREDICT_RATE;
 // The robust implementations use around 10% more CPU VS the standard flavours
 static bool robustTwr = false;
 static bool robustTdoa = false;
-// Plan (b), issue #80: forward-extrapolate delayed external (MOCAP) pose/position
-// measurements by v_world * age before fusing, to remove the latency bias. Default
-// off => behaviour identical to upstream; enable only after in-flight validation.
-static bool extPoseExtrapolate = false;
+// Issue #80: compensate the latency of a delayed external (MOCAP / markerless)
+// position or pose measurement before fusing it, using the per-sample age carried
+// on the wire. Default off => behaviour identical to upstream; enable only after
+// in-flight validation.
+//
+//   0 EXT_POSE_EXTRAP_OFF       fuse the measurement as received (upstream)
+//   1 EXT_POSE_EXTRAP_VELOCITY  plan (b): add v_world * age, i.e. assume the current
+//                               velocity held for the whole age window
+//   2 EXT_POSE_EXTRAP_HISTORY   plan (c): add the position displacement the filter
+//                               itself integrated over the age window, read from the
+//                               state history below. Algebraically the same as forming
+//                               the innovation against the capture-epoch state and
+//                               applying the correction now, so it is exact for the
+//                               mean on any trajectory, not just a straight constant-
+//                               velocity one. The covariance is still the current P
+//                               with the age-inflated R of plan (a) (locSrv.extPoseAgeStd*),
+//                               NOT the historical covariance a full OOSM replay would use.
+#define EXT_POSE_EXTRAP_OFF      0
+#define EXT_POSE_EXTRAP_VELOCITY 1
+#define EXT_POSE_EXTRAP_HISTORY  2
+static uint8_t extPoseExtrapMode = EXT_POSE_EXTRAP_OFF;
+
+// Safety cap against a bogus age injecting a jump. Also bounds the history lookup.
+#define EXT_POSE_MAX_AGE_MS 500
+
+// Magnitude of the last latency correction actually applied (m). Logged so a bag can
+// prove the mechanism fired, rather than the campaign having to trust the param.
+static float extrapLastNormM = 0.0f;
 
 /**
  * Quadrocopter State
@@ -252,6 +279,10 @@ static void kalmanTask(void* parameters) {
       kalmanCorePredict(&coreData, &coreParams, &accSubSampler.subSample, &gyroSubSampler.subSample, nowMs, quadIsFlying);
       nextPredictionMs = nowMs + PREDICTION_UPDATE_INTERVAL_MS;
 
+      // Issue #80: record the predicted position so a late measurement can be compared
+      // against the state as it was at its capture epoch (EXT_POSE_EXTRAP_HISTORY).
+      extPoseHistoryPush(nowMs, &coreData.S[KC_STATE_X]);
+
       STATS_CNT_RATE_EVENT(&predictionCounter);
 
       if (!rateSupervisorValidate(&rateSupervisorContext, nowMs)) {
@@ -302,23 +333,44 @@ void estimatorKalman(state_t *state, const stabilizerStep_t stabilizerStep) {
   xSemaphoreGive(runTaskSemaphore);
 }
 
-// Plan (b), issue #80: forward-predict a delayed external position/pose measurement
-// to "now" by adding v_world * age to it, so the EKF fuses it at (approximately) the
-// right place instead of at the reception-time state. Body-frame velocity is rotated
-// to world with coreData.R, exactly as the predict step does. Gated by
-// extPoseExtrapolate (default off) and a no-op when the age is 0 (unknown). The age
-// is clamped to 500 ms as a safety cap against a bogus timestamp injecting a jump.
-static void extrapolateExternalPos(float pos[3], uint16_t captureAgeMs) {
-  if (!extPoseExtrapolate || captureAgeMs == 0) {
+// Issue #80: shift a delayed external position/pose measurement forward to "now", so
+// the EKF fuses it against the current state instead of introducing a systematic lag
+// along the velocity vector. A no-op when disabled or when the age is 0 (unknown).
+// See the EXT_POSE_EXTRAP_* comment above for what each mode does. Mode 2 falls back
+// to mode 1 when the history cannot cover the age, so a fresh reset degrades rather
+// than silently skipping the compensation.
+static void extrapolateExternalPos(float pos[3], uint16_t captureAgeMs, uint32_t nowMs) {
+  if (extPoseExtrapMode == EXT_POSE_EXTRAP_OFF || captureAgeMs == 0) {
     return;
   }
-  const float ageSec = (captureAgeMs > 500 ? 500.0f : (float)captureAgeMs) * 0.001f;
-  for (int i = 0; i < 3; i++) {
-    const float vWorld_i = coreData.R[i][0] * coreData.S[KC_STATE_PX]
-                         + coreData.R[i][1] * coreData.S[KC_STATE_PY]
-                         + coreData.R[i][2] * coreData.S[KC_STATE_PZ];
-    pos[i] += vWorld_i * ageSec;
+  const uint16_t ageMs = captureAgeMs > EXT_POSE_MAX_AGE_MS ? EXT_POSE_MAX_AGE_MS : captureAgeMs;
+  float d[3] = {0.0f, 0.0f, 0.0f};
+  bool haveDelta = false;
+
+  if (extPoseExtrapMode == EXT_POSE_EXTRAP_HISTORY) {
+    float posThen[3];
+    if (extPoseHistoryLookup(nowMs - ageMs, posThen)) {
+      for (int i = 0; i < 3; i++) {
+        d[i] = coreData.S[KC_STATE_X + i] - posThen[i];
+      }
+      haveDelta = true;
+    }
   }
+
+  if (!haveDelta) {
+    const float ageSec = (float)ageMs * 0.001f;
+    for (int i = 0; i < 3; i++) {
+      const float vWorld_i = coreData.R[i][0] * coreData.S[KC_STATE_PX]
+                           + coreData.R[i][1] * coreData.S[KC_STATE_PY]
+                           + coreData.R[i][2] * coreData.S[KC_STATE_PZ];
+      d[i] = vWorld_i * ageSec;
+    }
+  }
+
+  for (int i = 0; i < 3; i++) {
+    pos[i] += d[i];
+  }
+  extrapLastNormM = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
 }
 
 static void updateQueuedMeasurements(const uint32_t nowMs, const bool quadIsFlying) {
@@ -341,11 +393,11 @@ static void updateQueuedMeasurements(const uint32_t nowMs, const bool quadIsFlyi
         }
         break;
       case MeasurementTypePosition:
-        extrapolateExternalPos(m.data.position.pos, m.data.position.captureAgeMs);
+        extrapolateExternalPos(m.data.position.pos, m.data.position.captureAgeMs, nowMs);
         kalmanCoreUpdateWithPosition(&coreData, &m.data.position);
         break;
       case MeasurementTypePose:
-        extrapolateExternalPos(m.data.pose.pos, m.data.pose.captureAgeMs);
+        extrapolateExternalPos(m.data.pose.pos, m.data.pose.captureAgeMs, nowMs);
         kalmanCoreUpdateWithPose(&coreData, &m.data.pose);
         break;
       case MeasurementTypeDistance:
@@ -410,6 +462,9 @@ void estimatorKalmanInit(void)
   outlierFilterTdoaReset(&outlierFilterTdoaState);
   outlierFilterLighthouseReset(&sweepOutlierFilterState, 0);
 
+  extPoseHistoryReset();
+  extrapLastNormM = 0.0f;
+
   uint32_t nowMs = T2M(xTaskGetTickCount());
   kalmanCoreInit(&coreData, &coreParams, nowMs);
 }
@@ -433,6 +488,17 @@ void estimatorKalmanGetEstimatedRot(float * rotationMatrix) {
  * Variables and results from the Extended Kalman Filter
  */
 LOG_GROUP_START(kalman)
+ /**
+ * @brief Issue #80: magnitude (m) of the last external-pose latency correction that
+ * was actually applied. 0 while compensation is off, the age is unknown, or the drone
+ * is stationary. Streamed so a bag can prove the mechanism fired on that trial.
+ */
+  LOG_ADD(LOG_FLOAT, extrapNorm, &extrapLastNormM)
+ /**
+ * @brief Issue #80: active external-pose latency compensation mode (0 off, 1 v*age,
+ * 2 state-history displacement). Mirrors the kalman.extPoseExtrap parameter.
+ */
+  LOG_ADD(LOG_UINT8, extrapMode, &extPoseExtrapMode)
  /**
  * @brief State position in the global frame x
  *
@@ -569,10 +635,12 @@ PARAM_GROUP_START(kalman)
  */
   PARAM_ADD_CORE(PARAM_UINT8, robustTwr, &robustTwr)
 /**
- * @brief Nonzero to forward-extrapolate delayed external (MOCAP) pose/position by
- * v*age before fusing, using the age carried on the wire (issue #80). Default 0.
+ * @brief Latency compensation for delayed external (MOCAP / markerless) pose and
+ * position, using the per-sample age carried on the wire (issue #80). Default 0.
+ * 0 = off (upstream behaviour), 1 = add v*age, 2 = add the filter's own integrated
+ * displacement over the age window (exact for the mean on curved trajectories).
  */
-  PARAM_ADD_CORE(PARAM_UINT8, extPoseExtrap, &extPoseExtrapolate)
+  PARAM_ADD_CORE(PARAM_UINT8, extPoseExtrap, &extPoseExtrapMode)
 /**
  * @brief Process noise for x and y acceleration
  */
