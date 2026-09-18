@@ -54,6 +54,7 @@ compiler:
       - 'src/modules/interface/controller/'
       - 'src/modules/interface/outlierfilter/'
       - 'src/modules/src/'
+      - 'src/modules/src/estimator/'
       - 'src/modules/src/kalman_core/'
       - 'src/modules/src/lighthouse/'
       - 'src/modules/src/outlierfilter/'
