@@ -138,14 +138,16 @@ static bool robustTdoa = false;
 //   0 EXT_POSE_EXTRAP_OFF       fuse the measurement as received (upstream)
 //   1 EXT_POSE_EXTRAP_VELOCITY  plan (b): add v_world * age, i.e. assume the current
 //                               velocity held for the whole age window
-//   2 EXT_POSE_EXTRAP_HISTORY   plan (c): add the position displacement the filter
-//                               itself integrated over the age window, read from the
-//                               state history below. Algebraically the same as forming
-//                               the innovation against the capture-epoch state and
-//                               applying the correction now, so it is exact for the
-//                               mean on any trajectory, not just a straight constant-
-//                               velocity one. The covariance is still the current P
-//                               with the age-inflated R of plan (a) (locSrv.extPoseAgeStd*),
+//   2 EXT_POSE_EXTRAP_HISTORY   plan (c): add the position displacement the IMU
+//                               prediction steps produced over the age window, summed
+//                               from ext_pose_history. Uses the velocity the filter held
+//                               at each instant rather than the current one, so it is
+//                               exact for the mean on a curved path where v*age is not.
+//                               Only the PREDICTION displacements are buffered, never the
+//                               corrected state: deriving the shift from the corrected
+//                               state fed each correction into the next and diverged on
+//                               hardware (2026-09-23). The covariance is still the current
+//                               P with the age-inflated R of plan (a) (locSrv.extPoseAgeStd*),
 //                               NOT the historical covariance a full OOSM replay would use.
 #define EXT_POSE_EXTRAP_OFF      0
 #define EXT_POSE_EXTRAP_VELOCITY 1
@@ -276,12 +278,17 @@ static void kalmanTask(void* parameters) {
       axis3fSubSamplerFinalize(&accSubSampler);
       axis3fSubSamplerFinalize(&gyroSubSampler);
 
+      // Issue #80: record the displacement this prediction step produces, so a late
+      // measurement can be shifted by the motion integrated over its age
+      // (EXT_POSE_EXTRAP_HISTORY). Deliberately the prediction's own delta and not the
+      // state, so measurement corrections never feed back into the shift.
+      const float posBefore[3] = {coreData.S[KC_STATE_X], coreData.S[KC_STATE_Y], coreData.S[KC_STATE_Z]};
       kalmanCorePredict(&coreData, &coreParams, &accSubSampler.subSample, &gyroSubSampler.subSample, nowMs, quadIsFlying);
       nextPredictionMs = nowMs + PREDICTION_UPDATE_INTERVAL_MS;
-
-      // Issue #80: record the predicted position so a late measurement can be compared
-      // against the state as it was at its capture epoch (EXT_POSE_EXTRAP_HISTORY).
-      extPoseHistoryPush(nowMs, &coreData.S[KC_STATE_X]);
+      const float predictDelta[3] = {coreData.S[KC_STATE_X] - posBefore[0],
+                                     coreData.S[KC_STATE_Y] - posBefore[1],
+                                     coreData.S[KC_STATE_Z] - posBefore[2]};
+      extPoseHistoryPush(nowMs, predictDelta);
 
       STATS_CNT_RATE_EVENT(&predictionCounter);
 
@@ -341,17 +348,31 @@ void estimatorKalman(state_t *state, const stabilizerStep_t stabilizerStep) {
 // than silently skipping the compensation.
 static void extrapolateExternalPos(float pos[3], uint16_t captureAgeMs, uint32_t nowMs) {
   if (extPoseExtrapMode == EXT_POSE_EXTRAP_OFF || captureAgeMs == 0) {
+    extrapLastNormM = 0.0f;  // the log must read 0 whenever nothing is applied
     return;
   }
   const uint16_t ageMs = captureAgeMs > EXT_POSE_MAX_AGE_MS ? EXT_POSE_MAX_AGE_MS : captureAgeMs;
   float d[3] = {0.0f, 0.0f, 0.0f};
   bool haveDelta = false;
 
+  float vWorld[3];
+  for (int i = 0; i < 3; i++) {
+    vWorld[i] = coreData.R[i][0] * coreData.S[KC_STATE_PX]
+              + coreData.R[i][1] * coreData.S[KC_STATE_PY]
+              + coreData.R[i][2] * coreData.S[KC_STATE_PZ];
+  }
+
   if (extPoseExtrapMode == EXT_POSE_EXTRAP_HISTORY) {
-    float posThen[3];
-    if (extPoseHistoryLookup(nowMs - ageMs, posThen)) {
+    if (extPoseHistoryDisplacement(nowMs, ageMs, d)) {
+      // The history ends at the newest prediction step; cover the few ms since then
+      // with the current velocity, capped so a tiny age never over-extends.
+      uint32_t tailMs = nowMs - extPoseHistoryNewestMs();
+      if (tailMs > ageMs) {
+        tailMs = ageMs;
+      }
+      const float tailSec = (float)tailMs * 0.001f;
       for (int i = 0; i < 3; i++) {
-        d[i] = coreData.S[KC_STATE_X + i] - posThen[i];
+        d[i] += vWorld[i] * tailSec;
       }
       haveDelta = true;
     }
@@ -360,10 +381,7 @@ static void extrapolateExternalPos(float pos[3], uint16_t captureAgeMs, uint32_t
   if (!haveDelta) {
     const float ageSec = (float)ageMs * 0.001f;
     for (int i = 0; i < 3; i++) {
-      const float vWorld_i = coreData.R[i][0] * coreData.S[KC_STATE_PX]
-                           + coreData.R[i][1] * coreData.S[KC_STATE_PY]
-                           + coreData.R[i][2] * coreData.S[KC_STATE_PZ];
-      d[i] = vWorld_i * ageSec;
+      d[i] = vWorld[i] * ageSec;
     }
   }
 
