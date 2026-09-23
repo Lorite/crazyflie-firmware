@@ -1,10 +1,11 @@
 // File under test ext_pose_history.c
 //
-// Issue #80: the state history that lets a delayed external measurement be compared
-// against the state as it was at its capture epoch, instead of against the state at
-// reception. The load-bearing case is testCurvedMotion...: it is the one where the
-// old constant-velocity compensation (v_now * age) is measurably wrong and this
-// module is right, which is why the latency A/B flies figure8 rather than hover.
+// Issue #80: the history of IMU prediction displacements that lets a delayed external
+// measurement be shifted by the motion the filter integrated over its age. The
+// load-bearing cases are testCurvedMotion... (why this beats v_now * age) and
+// testCorrections... (why the buffer holds prediction deltas and not the state: the
+// state-based version fed every correction back into the next and diverged on
+// hardware on 2026-09-23).
 
 #include "ext_pose_history.h"
 
@@ -14,7 +15,7 @@
 // Velocity therefore differs from the mean velocity over any window, which is exactly
 // what breaks the constant-velocity assumption.
 static const float ACCEL_MPS2 = 10.0f;
-static const uint32_t PREDICT_STEP_MS = 10;  // PREDICT_RATE = 100 Hz
+static const uint32_t STEP_MS = 10;  // PREDICT_RATE = 100 Hz
 
 static float refX(uint32_t tMs) {
   const float t = (float)tMs * 0.001f;
@@ -25,11 +26,14 @@ static float refV(uint32_t tMs) {
   return ACCEL_MPS2 * (float)tMs * 0.001f;
 }
 
-// Fill the history with the reference trajectory, one sample per prediction step.
-static void pushReferenceUpTo(uint32_t lastMs) {
-  for (uint32_t t = 0; t <= lastMs; t += PREDICT_STEP_MS) {
-    const float pos[3] = {refX(t), 0.0f, 0.0f};
-    extPoseHistoryPush(t, pos);
+// Push the reference trajectory as per-step displacements, one per prediction step,
+// starting with a zero-extent sample at t0 (what the first push after a reset is).
+static void pushReference(uint32_t t0Ms, uint32_t lastMs) {
+  const float zero[3] = {0.0f, 0.0f, 0.0f};
+  extPoseHistoryPush(t0Ms, zero);
+  for (uint32_t t = t0Ms + STEP_MS; t <= lastMs; t += STEP_MS) {
+    const float delta[3] = {refX(t) - refX(t - STEP_MS), 0.0f, 0.0f};
+    extPoseHistoryPush(t, delta);
   }
 }
 
@@ -41,105 +45,123 @@ void tearDown(void) {
   // Empty
 }
 
-void testThatLookupFailsOnAnEmptyHistory() {
-  float pos[3] = {9.0f, 9.0f, 9.0f};
-  TEST_ASSERT_FALSE(extPoseHistoryLookup(0, pos));
+void testThatAnEmptyHistoryCoversNothing() {
+  float d[3] = {9.0f, 9.0f, 9.0f};
+  TEST_ASSERT_FALSE(extPoseHistoryDisplacement(100, 50, d));
+  TEST_ASSERT_EQUAL_UINT32(0, extPoseHistoryNewestMs());
 }
 
-void testThatLookupFailsWithASingleSample() {
-  const float p[3] = {1.0f, 2.0f, 3.0f};
-  extPoseHistoryPush(100, p);
+void testThatTheFirstSampleAloneCannotProveCoverage() {
+  const float delta[3] = {1.0f, 0.0f, 0.0f};
+  extPoseHistoryPush(100, delta);
 
-  float pos[3];
+  float d[3];
   TEST_ASSERT_EQUAL_UINT8(1, extPoseHistoryCount());
-  TEST_ASSERT_FALSE(extPoseHistoryLookup(100, pos));
+  TEST_ASSERT_FALSE(extPoseHistoryDisplacement(100, 50, d));
 }
 
-void testThatAnExactSampleTimeReturnsThatSample() {
-  pushReferenceUpTo(200);
+void testThatAWindowAlignedToStepsSumsExactly() {
+  pushReference(0, 200);
 
-  float pos[3];
-  TEST_ASSERT_TRUE(extPoseHistoryLookup(100, pos));
-  TEST_ASSERT_FLOAT_WITHIN(1e-6f, refX(100), pos[0]);
+  // Window (100, 200]: ten whole steps.
+  float d[3];
+  TEST_ASSERT_TRUE(extPoseHistoryDisplacement(200, 100, d));
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, refX(200) - refX(100), d[0]);
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.0f, d[1]);
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.0f, d[2]);
 }
 
-void testThatATimeBetweenSamplesIsInterpolated() {
-  pushReferenceUpTo(200);
+void testThatAStraddlingStepCountsByItsFraction() {
+  pushReference(0, 200);
 
-  // 105 ms sits halfway between the 100 ms and 110 ms samples. Linear interpolation
-  // of a quadratic leaves well under a millimetre of error at this step size.
-  float pos[3];
-  TEST_ASSERT_TRUE(extPoseHistoryLookup(105, pos));
-  TEST_ASSERT_FLOAT_WITHIN(0.0005f, refX(105), pos[0]);
+  // Window (105, 200]: nine whole steps plus half of the (100, 110] step. Linear
+  // interpolation of a quadratic leaves well under a millimetre of error.
+  float d[3];
+  TEST_ASSERT_TRUE(extPoseHistoryDisplacement(200, 95, d));
+  TEST_ASSERT_FLOAT_WITHIN(0.0005f, refX(200) - refX(105), d[0]);
 }
 
-void testThatATimeNewerThanTheNewestSampleClampsToIt() {
-  pushReferenceUpTo(200);
+void testThatMotionAfterTheNewestStepIsNotInvented() {
+  pushReference(0, 200);
 
-  float pos[3];
-  TEST_ASSERT_TRUE(extPoseHistoryLookup(207, pos));
-  TEST_ASSERT_FLOAT_WITHIN(1e-6f, refX(200), pos[0]);
+  // The caller is at 207 ms but the newest step ended at 200: the history reports
+  // only (107, 200] and tells the caller where it ends, so the caller can extend.
+  float d[3];
+  TEST_ASSERT_TRUE(extPoseHistoryDisplacement(207, 100, d));
+  TEST_ASSERT_FLOAT_WITHIN(0.0005f, refX(200) - refX(107), d[0]);
+  TEST_ASSERT_EQUAL_UINT32(200, extPoseHistoryNewestMs());
 }
 
-void testThatATimeOlderThanTheWholeHistoryFails() {
-  const float a[3] = {1.0f, 0.0f, 0.0f};
-  const float b[3] = {2.0f, 0.0f, 0.0f};
-  extPoseHistoryPush(1000, a);
-  extPoseHistoryPush(1010, b);
+void testThatAnAgePastTheHistoryIsReportedNotClamped() {
+  pushReference(1000, 1050);
 
-  float pos[3];
-  TEST_ASSERT_FALSE(extPoseHistoryLookup(900, pos));
+  float d[3];
+  TEST_ASSERT_FALSE(extPoseHistoryDisplacement(1050, 100, d));
 }
 
-void testThatTheRingWrapsAndKeepsTheRecentSamples() {
+void testThatTheRingWrapsAndKeepsTheRecentSteps() {
   // Three times the buffer length, so every slot has been overwritten twice.
-  const uint32_t lastMs = 3 * EXT_POSE_HISTORY_LEN * PREDICT_STEP_MS;
-  pushReferenceUpTo(lastMs);
+  const uint32_t lastMs = 3 * EXT_POSE_HISTORY_LEN * STEP_MS;
+  pushReference(0, lastMs);
 
   TEST_ASSERT_EQUAL_UINT8(EXT_POSE_HISTORY_LEN, extPoseHistoryCount());
 
-  // The newest 640 ms are still exact...
-  float pos[3];
-  const uint32_t insideMs = lastMs - (EXT_POSE_HISTORY_LEN - 1) * PREDICT_STEP_MS;
-  TEST_ASSERT_TRUE(extPoseHistoryLookup(insideMs, pos));
-  TEST_ASSERT_FLOAT_WITHIN(1e-4f, refX(insideMs), pos[0]);
+  // A window inside the retained 640 ms is exact...
+  float d[3];
+  TEST_ASSERT_TRUE(extPoseHistoryDisplacement(lastMs, 500, d));
+  TEST_ASSERT_FLOAT_WITHIN(1e-3f, refX(lastMs) - refX(lastMs - 500), d[0]);
 
-  // ...and anything older than the window is honestly reported as unavailable,
-  // rather than silently clamped to the oldest sample.
-  TEST_ASSERT_FALSE(extPoseHistoryLookup(insideMs - PREDICT_STEP_MS - 1, pos));
+  // ...and one reaching past the oldest retained step is honestly unavailable,
+  // never silently truncated.
+  TEST_ASSERT_FALSE(extPoseHistoryDisplacement(lastMs, EXT_POSE_HISTORY_LEN * STEP_MS + 1, d));
 }
 
 void testThatResetDropsEverything() {
-  pushReferenceUpTo(200);
+  pushReference(0, 200);
   TEST_ASSERT_TRUE(extPoseHistoryCount() > 0);
 
   extPoseHistoryReset();
 
-  float pos[3];
+  float d[3];
   TEST_ASSERT_EQUAL_UINT8(0, extPoseHistoryCount());
-  TEST_ASSERT_FALSE(extPoseHistoryLookup(100, pos));
+  TEST_ASSERT_FALSE(extPoseHistoryDisplacement(200, 100, d));
 }
 
-void testThatOnCurvedMotionTheHistoryDeltaBeatsConstantVelocity() {
-  // A measurement captured at 100 ms arrives when the filter is at 200 ms, so the
-  // correction that shifts it to "now" should be the distance actually travelled in
-  // that window.
+void testThatOnCurvedMotionTheHistoryBeatsConstantVelocity() {
+  // A measurement captured at 100 ms arrives at 200 ms. The shift that moves it to
+  // "now" should be the distance actually travelled in that window.
   const uint32_t nowMs = 200;
   const uint32_t ageMs = 100;
-  pushReferenceUpTo(nowMs);
+  pushReference(0, nowMs);
 
-  float posThen[3];
-  TEST_ASSERT_TRUE(extPoseHistoryLookup(nowMs - ageMs, posThen));
+  float d[3];
+  TEST_ASSERT_TRUE(extPoseHistoryDisplacement(nowMs, ageMs, d));
 
   const float trueDisplacement = refX(nowMs) - refX(nowMs - ageMs);   // 0.15 m
-  const float historyDelta = refX(nowMs) - posThen[0];
   const float velocityDelta = refV(nowMs) * (float)ageMs * 0.001f;    // 0.20 m
 
-  // The history reproduces the real displacement to well under a millimetre.
-  TEST_ASSERT_FLOAT_WITHIN(0.0005f, trueDisplacement, historyDelta);
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, trueDisplacement, d[0]);
 
-  // The constant-velocity assumption overshoots it by 5 cm here, which is the error
-  // this module exists to remove. Assert the gap so the test fails loudly if someone
-  // ever makes the two equivalent.
+  // The constant-velocity assumption overshoots by 5 cm here, which is the error this
+  // module exists to remove. Assert the gap so the test fails loudly if someone ever
+  // makes the two equivalent.
   TEST_ASSERT_FLOAT_WITHIN(0.002f, 0.05f, velocityDelta - trueDisplacement);
+}
+
+void testThatMeasurementCorrectionsCannotLeakIntoTheShift() {
+  // The drone is perfectly still, so every prediction step moves it by zero. Meanwhile
+  // (in the estimator, not here) trusted measurements keep yanking the corrected state
+  // around. Because only prediction deltas are pushed, the shift stays exactly zero no
+  // matter what the corrected state did. The state-based design failed this on
+  // hardware: with a 12-sample delay the loop S_k = S_{k-1} + z - S_{k-1-D} diverged.
+  const float zero[3] = {0.0f, 0.0f, 0.0f};
+  for (uint32_t t = 0; t <= 300; t += STEP_MS) {
+    extPoseHistoryPush(t, zero);
+  }
+
+  float d[3] = {1.0f, 1.0f, 1.0f};
+  TEST_ASSERT_TRUE(extPoseHistoryDisplacement(300, 100, d));
+  TEST_ASSERT_EQUAL_FLOAT(0.0f, d[0]);
+  TEST_ASSERT_EQUAL_FLOAT(0.0f, d[1]);
+  TEST_ASSERT_EQUAL_FLOAT(0.0f, d[2]);
 }
