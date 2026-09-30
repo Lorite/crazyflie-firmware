@@ -46,3 +46,11 @@ extern uint32_t espDeckFlasherNewBinarySize;
 bool espDeckFlasherWrite(const uint32_t memAddr, const uint8_t writeLen, const uint8_t *buffer, const DeckMemDef_t* memDef);
 
 uint8_t espDeckFlasherPropertiesQuery();
+
+/**
+* @brief Start a new write session: the next write must be at address 0.
+*
+* Called when the ESP32 is reset into its bootloader, before every flash. Writes below the
+* expected address are then treated as resends and dropped (see espDeckFlasherWrite).
+**/
+void espDeckFlasherResetSession();

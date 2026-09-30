@@ -48,6 +48,11 @@ static uint32_t numberOfFlashBuffers;
 static uint8_t sendBuffer[ESP_SLIP_DATA_START + ESP_SLIP_MTU + ESP_SLIP_STOP_CODE_LEN];
 static uint8_t overshoot;
 static uint32_t sendBufferIndex;
+// Next deck memory address the write stream expects. A host resends a chunk whose reply it
+// did not get in time (cflib after 0.2 s to 1 s), and appending that chunk a second time
+// shifts the rest of the image, so the ESP32 app no longer boots. A resent first chunk also
+// ran a new flash erase each time. Chunks below this address are acknowledged and dropped.
+static uint32_t nextWriteAddr = 0;
 
 
 static bool initialize() {
@@ -100,7 +105,19 @@ static void appendOvershootToSendBuffer(const uint8_t writeLen, const uint8_t *b
 }
 
 
+void espDeckFlasherResetSession() {
+  nextWriteAddr = 0;
+}
+
 bool espDeckFlasherWrite(const uint32_t memAddr, const uint8_t writeLen, const uint8_t *buffer, const DeckMemDef_t* memDef) {
+  if (memAddr < nextWriteAddr) {
+    return true;  // a resent chunk that is already written
+  }
+  if (memAddr > nextWriteAddr) {
+    DEBUG_PRINT("Write failed - chunk at %lu, expected %lu\n", (unsigned long)memAddr, (unsigned long)nextWriteAddr);
+    return false;
+  }
+
   if (memAddr == 0) {
     if (!initialize()) {
       return false;
@@ -130,5 +147,6 @@ bool espDeckFlasherWrite(const uint32_t memAddr, const uint8_t writeLen, const u
     }
   }
 
+  nextWriteAddr = memAddr + writeLen;
   return true;
 }
