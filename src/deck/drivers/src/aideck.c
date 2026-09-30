@@ -230,6 +230,7 @@ static uint8_t gap8DeckFlasherPropertiesQuery()
 
 static void resetEspToBootloader() {
   espMode = ESP_MODE_PREPARE_FOR_BOOTLOADER;
+  espDeckFlasherResetSession();
 
   // Free up the UART and re-initialize it to the correct
   // baud rate.
