@@ -156,7 +156,21 @@ static void waitForCpxResponse() {
   ASSERT(flashWritten);
 }
 
+// Next GAP8 deck memory address the write stream expects, for the same reason as nextWriteAddr
+// in esp_deck_flasher.c. A resent chunk was appended a second time, a resent first chunk
+// restarted the flash, and a resent last chunk tripped the size ASSERT below. The MD5 reply is
+// not checked, so a shifted image went unnoticed. Chunks below this address are dropped.
+static uint32_t gap8NextWriteAddr = 0;
+
 static bool gap8DeckFlasherWrite(const uint32_t memAddr, const uint8_t writeLen, const uint8_t *buffer, const DeckMemDef_t* memDef) {
+  if (memAddr < gap8NextWriteAddr) {
+    return true;  // a resent chunk that is already written
+  }
+  if (memAddr > gap8NextWriteAddr) {
+    DEBUG_PRINT("GAP8 write failed - chunk at %lu, expected %lu\n", (unsigned long)memAddr, (unsigned long)gap8NextWriteAddr);
+    return false;
+  }
+
   cpxInitRoute(CPX_T_STM32, CPX_T_GAP8, CPX_F_BOOTLOADER, &txPacket.route);
 
   const uint32_t fwSize = *(memDef->newFwSizeP);
@@ -193,6 +207,7 @@ static bool gap8DeckFlasherWrite(const uint32_t memAddr, const uint8_t writeLen,
     waitForCpxResponse();
   }
 
+  gap8NextWriteAddr = memAddr + writeLen;
   return true;
 }
 
@@ -200,6 +215,7 @@ static bool gap8DeckFlasherWrite(const uint32_t memAddr, const uint8_t writeLen,
 static bool isGap8InBootloaderMode = false;
 
 static void resetGap8ToBootloader() {
+  gap8NextWriteAddr = 0;
   cpxInitRoute(CPX_T_STM32, CPX_T_ESP32, CPX_F_SYSTEM, &txPacket.route);
 
   ESP32SysPacket_t* esp32SysPacket = (ESP32SysPacket_t*)txPacket.data;
