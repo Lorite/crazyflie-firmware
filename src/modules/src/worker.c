@@ -34,8 +34,17 @@
 #include "static_mem.h"
 
 #include "console.h"
+#include "log.h"
 
 #define WORKER_QUEUE_LENGTH 5
+
+// The worker must preempt the timer service task: the log blocks are scheduled from timer
+// callbacks with a zero timeout, so a worker at the same or a lower priority lets them overflow
+// the queue and lose whole blocks (see WORKER_TASK_PRI in config.h).
+_Static_assert(WORKER_TASK_PRI > configTIMER_TASK_PRIORITY,
+               "WORKER_TASK_PRI must be above configTIMER_TASK_PRIORITY, or log blocks are dropped");
+
+static uint32_t workerDropped = 0;
 
 struct worker_work {
   void (*function)(void*);
@@ -91,7 +100,21 @@ int workerSchedule(void (*function)(void*), void *arg)
   work.function = function;
   work.arg = arg;
   if (xQueueSend(workerQueue, &work, 0) == pdFALSE)
+  {
+    workerDropped++;
     return ENOMEM;
+  }
 
   return 0;
 }
+
+/**
+ * The worker system, which runs the log blocks and other deferred work.
+ */
+LOG_GROUP_START(worker)
+/**
+ * @brief Number of work items dropped because the worker queue was full, since boot.
+ * A growing value means log block samples (or other deferred work) are lost.
+ */
+LOG_ADD(LOG_UINT32, dropped, &workerDropped)
+LOG_GROUP_STOP(worker)

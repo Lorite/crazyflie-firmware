@@ -102,7 +102,13 @@
 #define CRTP_SRV_TASK_PRI         0
 #define PLATFORM_SRV_TASK_PRI     0
 #define COLORLED_TASK_PRIO        1
-#define WORKER_TASK_PRI           1
+// The worker runs the log blocks (log.c schedules each block from a FreeRTOS timer callback).
+// Until upstream 90b7a9fd (Dec 2025) it ran inside the system task, at SYSTEM_TASK_PRI (2).
+// At 1 it shares the priority of the timer service task (configTIMER_TASK_PRIORITY), so it no
+// longer preempts the timer callbacks: expired log timers pile up in its 5-entry queue, and
+// workerSchedule() drops the rest without an error. With ten log blocks and a mocap feed,
+// whole blocks went silent (Lorite #111, 2026-11-04). worker.c asserts the order at compile time.
+#define WORKER_TASK_PRI           2
 #define SUPERVISOR_TASK_PRI       1
 
 // Not compiled
