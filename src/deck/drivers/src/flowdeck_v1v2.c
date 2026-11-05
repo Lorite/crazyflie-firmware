@@ -40,6 +40,11 @@
 
 #include "usec_time.h"
 #include <stdlib.h>
+#include <string.h>
+
+#include "mem.h"
+#include "range.h"
+#include "supervisor.h"
 
 #define AVERAGE_HISTORY_LENGTH 4
 #define OULIER_LIMIT 100
@@ -78,6 +83,159 @@ static float flowStdFixed = 2.0f;
 
 #define NCS_PIN DECK_GPIO_IO3
 
+/*
+ * Raw frame capture (Lorite #171), off by default.
+ *
+ * A capture switches the PMW3901 into frame mode, reads one 35 x 35 frame and
+ * re-initializes the sensor. During that time the deck delivers no motion, so
+ * the EKF gets no flow (logged as flowFrame.gapMs). The capture busy-waits on
+ * SPI (sleepus), so this task drops to the idle priority while it reads:
+ * at FLOW_TASK_PRI (3) it would starve the Kalman, CRTP and range tasks (2).
+ * Captures are refused while the drone is armed or flying unless
+ * flowFrame.allowFlying is set.
+ *
+ * The newest complete frame is served on memory type MEM_TYPE_FLOW_FRAME:
+ * bytes 0 to 1224 are the pixels (row-major), followed by the metadata below.
+ */
+typedef struct {
+  uint8_t pixels[PMW3901_FRAME_PIXELS];
+  uint16_t seq;          // capture counter, also counts failed captures
+  uint8_t ok;            // bit 0: frame complete, bit 1: re-init failed
+  uint8_t tsradUs;       // address-data delay used
+  uint32_t startMs;      // system time at the start of the capture [ms]
+  uint32_t captureUs;    // pixel read time
+  uint32_t gapUs;        // whole time without motion output (enable + read + re-init)
+  uint16_t rangeMm;      // range.zrange at the start of the capture
+  uint16_t invalidReads;
+  uint16_t orderErrors;
+} __attribute__((packed)) flowFrame_t;
+
+// The host side (scripts/crazyflie_bench/cf_flow_frame.py in lorite_ros2_humble_phd) unpacks
+// this layout as '<HBBIIIHHH' after the pixels. Change both together.
+_Static_assert(sizeof(flowFrame_t) == PMW3901_FRAME_PIXELS + 22, "flowFrame_t layout changed");
+
+static flowFrame_t frames[2];
+static volatile uint8_t latestFrame = 0;
+static flowFrame_t frameMemSnapshot;
+static bool frameMemRegistered = false;
+
+static uint8_t frameTrigger = 0;        // param: write 1 for one capture
+static uint16_t framePeriodMs = 0;      // param: > 0 captures periodically
+static uint8_t frameTsradUs = 50;       // param: Bitcraze's Arduino driver waits 50 us
+static uint16_t frameTimeoutMs = 3000;  // param
+static uint8_t frameAllowFlying = 0;    // param: 1 allows captures when armed or flying
+
+static uint16_t frameSeq = 0;           // log
+static uint8_t frameOk = 0;             // log
+static uint16_t frameCaptureMs = 0;     // log
+static uint16_t frameGapMs = 0;         // log
+static uint16_t frameInvalid = 0;       // log
+static uint16_t frameRefused = 0;       // log
+static uint32_t lastFrameEndMs = 0;
+static bool discardNextMotion = false;
+
+static uint32_t frameMemGetSize(void)
+{
+  return sizeof(flowFrame_t);
+}
+
+static bool frameMemRead(const uint32_t memAddr, const uint8_t readLen, uint8_t* buffer)
+{
+  if (memAddr == 0) {
+    // Snapshot the newest complete frame when a read starts at address 0, so
+    // that one host read of the whole memory returns one consistent frame.
+    vTaskSuspendAll();
+    memcpy(&frameMemSnapshot, &frames[latestFrame], sizeof(flowFrame_t));
+    xTaskResumeAll();
+  }
+
+  if (memAddr + readLen > sizeof(flowFrame_t)) {
+    return false;
+  }
+
+  memcpy(buffer, ((const uint8_t*)&frameMemSnapshot) + memAddr, readLen);
+  return true;
+}
+
+static const MemoryHandlerDef_t frameMemDef = {
+  .type = MEM_TYPE_FLOW_FRAME,
+  .getSize = frameMemGetSize,
+  .read = frameMemRead,
+  .write = 0,
+};
+
+static void flowFrameInit(void)
+{
+  if (!frameMemRegistered) {
+    memoryRegisterHandler(&frameMemDef);
+    frameMemRegistered = true;
+  }
+}
+
+static bool flowFrameDue(void)
+{
+  const uint32_t nowMs = T2M(xTaskGetTickCount());
+  const bool periodic = framePeriodMs > 0 && (nowMs - lastFrameEndMs) >= framePeriodMs;
+  if (!frameTrigger && !periodic) {
+    return false;
+  }
+  frameTrigger = 0;
+
+  if (!frameAllowFlying && (supervisorIsArmed() || supervisorIsFlying())) {
+    frameRefused++;
+    lastFrameEndMs = nowMs;
+    return false;
+  }
+  return true;
+}
+
+static void flowFrameCapture(void)
+{
+  const uint8_t target = 1 - latestFrame;
+  flowFrame_t* frame = &frames[target];
+
+  frame->startMs = T2M(xTaskGetTickCount());
+  frame->rangeMm = (uint16_t)(rangeGet(rangeDown) * 1000.0f);
+  frame->tsradUs = frameTsradUs;
+
+  const uint64_t start = usecTimestamp();
+  const UBaseType_t priority = uxTaskPriorityGet(NULL);
+  vTaskPrioritySet(NULL, tskIDLE_PRIORITY);
+
+  pmw3901FrameStats_t stats;
+  pmw3901EnableFrameCapture(NCS_PIN);
+  const bool complete = pmw3901ReadFrame(NCS_PIN, frame->pixels, frameTsradUs,
+                                         (uint32_t)frameTimeoutMs * 1000u, &stats);
+
+  bool reinit = false;
+  for (int attempt = 0; attempt < 3 && !reinit; attempt++) {
+    reinit = pmw3901Reinit(NCS_PIN);
+  }
+
+  vTaskPrioritySet(NULL, priority);
+
+  frame->gapUs = (uint32_t)(usecTimestamp() - start);
+  frame->captureUs = stats.captureUs;
+  frame->invalidReads = stats.invalidReads;
+  frame->orderErrors = stats.orderErrors;
+  frame->ok = (complete ? 0x01 : 0x00) | (reinit ? 0x00 : 0x02);
+  frame->seq = ++frameSeq;
+
+  if (complete) {
+    latestFrame = target;
+  }
+  if (!reinit) {
+    DEBUG_PRINT("Frame capture: PMW3901 re-init FAILED, no flow from now on\n");
+  }
+
+  frameOk = frame->ok;
+  frameCaptureMs = (uint16_t)(stats.captureUs / 1000u);
+  frameGapMs = (uint16_t)(frame->gapUs / 1000u);
+  frameInvalid = stats.invalidReads;
+  lastFrameEndMs = T2M(xTaskGetTickCount());
+  discardNextMotion = true;
+}
+
 
 static void flowdeckTask(void *param)
 {
@@ -87,7 +245,20 @@ static void flowdeckTask(void *param)
   while(1) {
     vTaskDelay(10);
 
+    if (flowFrameDue()) {
+      flowFrameCapture();
+      lastTime = usecTimestamp();
+      continue;
+    }
+
     pmw3901ReadMotion(NCS_PIN, &currentMotion);
+
+    if (discardNextMotion) {
+      // The first burst after a re-init covers the reset, not 10 ms of flight
+      discardNextMotion = false;
+      lastTime = usecTimestamp();
+      continue;
+    }
 
     // Flip motion information to comply with sensor mounting
     // (might need to be changed if mounted differently)
@@ -175,6 +346,7 @@ static void flowdeck1Init()
 
   if (pmw3901Init(NCS_PIN))
   {
+    flowFrameInit();
     xTaskCreate(flowdeckTask, FLOW_TASK_NAME, FLOW_TASK_STACKSIZE, NULL,
                 FLOW_TASK_PRI, NULL);
 
@@ -221,6 +393,7 @@ static void flowdeck2Init()
 
   if (pmw3901Init(NCS_PIN))
   {
+    flowFrameInit();
     xTaskCreate(flowdeckTask, FLOW_TASK_NAME, FLOW_TASK_STACKSIZE, NULL,
                 FLOW_TASK_PRI, NULL);
 
@@ -334,3 +507,60 @@ PARAM_ADD_CORE(PARAM_UINT8 | PARAM_RONLY, bcFlow, &isInit1)
 PARAM_ADD_CORE(PARAM_UINT8 | PARAM_RONLY, bcFlow2, &isInit2)
 
 PARAM_GROUP_STOP(deck)
+
+/**
+ * Raw PMW3901 frame capture (Lorite #171). The frame itself is served on
+ * memory type 0x1B, see flowFrame_t.
+ */
+LOG_GROUP_START(flowFrame)
+/**
+ * @brief Capture counter (complete and failed captures)
+ */
+LOG_ADD(LOG_UINT16, seq, &frameSeq)
+/**
+ * @brief Bit 0: the last frame is complete, bit 1: the sensor re-init failed
+ */
+LOG_ADD(LOG_UINT8, ok, &frameOk)
+/**
+ * @brief Pixel read time of the last capture [ms]
+ */
+LOG_ADD(LOG_UINT16, captureMs, &frameCaptureMs)
+/**
+ * @brief Time without flow to the estimator during the last capture [ms]
+ */
+LOG_ADD(LOG_UINT16, gapMs, &frameGapMs)
+/**
+ * @brief Status reads without pixel data in the last capture
+ */
+LOG_ADD(LOG_UINT16, invalid, &frameInvalid)
+/**
+ * @brief Captures refused because the drone was armed or flying
+ */
+LOG_ADD(LOG_UINT16, refused, &frameRefused)
+LOG_GROUP_STOP(flowFrame)
+
+/**
+ * Raw PMW3901 frame capture (Lorite #171), off by default.
+ */
+PARAM_GROUP_START(flowFrame)
+/**
+ * @brief Write 1 to capture one frame (cleared by the firmware)
+ */
+PARAM_ADD(PARAM_UINT8, trigger, &frameTrigger)
+/**
+ * @brief Capture a frame every periodMs milliseconds, 0 = off (default)
+ */
+PARAM_ADD(PARAM_UINT16, periodMs, &framePeriodMs)
+/**
+ * @brief SPI address-data delay during the frame read [us] (datasheet tSRAD 35, default 50)
+ */
+PARAM_ADD(PARAM_UINT8, tsradUs, &frameTsradUs)
+/**
+ * @brief Abort a capture after this time [ms]
+ */
+PARAM_ADD(PARAM_UINT16, timeoutMs, &frameTimeoutMs)
+/**
+ * @brief 1 allows captures while armed or flying (the EKF then gets no flow for flowFrame.gapMs)
+ */
+PARAM_ADD(PARAM_UINT8, allowFlying, &frameAllowFlying)
+PARAM_GROUP_STOP(flowFrame)

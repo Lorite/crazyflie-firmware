@@ -33,6 +33,7 @@
 #include "log.h"
 #include "param.h"
 #include "sleepus.h"
+#include "usec_time.h"
 
 
 static bool isInit = false;
@@ -168,6 +169,23 @@ static void InitRegisters(const deckPin_t csPin)
   registerWrite(csPin, 0x54, 0x00);
 }
 
+static void powerOnResetAndConfigure(const deckPin_t csPin)
+{
+  // Power on reset
+  registerWrite(csPin, 0x3a, 0x5a);
+  vTaskDelay(M2T(5));
+
+  // Reading the motion registers one time
+  registerRead(csPin, 0x02);
+  registerRead(csPin, 0x03);
+  registerRead(csPin, 0x04);
+  registerRead(csPin, 0x05);
+  registerRead(csPin, 0x06);
+  vTaskDelay(M2T(1));
+
+  InitRegisters(csPin);
+}
+
 bool pmw3901Init(const deckPin_t csPin)
 {
   if (isInit) {
@@ -195,19 +213,7 @@ bool pmw3901Init(const deckPin_t csPin)
 
   if (chipId == 0x49 && invChipId == 0xB6)
   {
-    // Power on reset
-    registerWrite(csPin, 0x3a, 0x5a);
-    vTaskDelay(M2T(5));
-
-    // Reading the motion registers one time
-    registerRead(csPin, 0x02);
-    registerRead(csPin, 0x03);
-    registerRead(csPin, 0x04);
-    registerRead(csPin, 0x05);
-    registerRead(csPin, 0x06);
-    vTaskDelay(M2T(1));
-
-    InitRegisters(csPin);
+    powerOnResetAndConfigure(csPin);
 
     isInit = true;
   }
@@ -233,4 +239,126 @@ void pmw3901ReadMotion(const deckPin_t csPin, motionBurst_t * motion)
   uint16_t realShutter = (motion->shutter >> 8) & 0x0FF;
   realShutter |= (motion->shutter & 0x0ff) << 8;
   motion->shutter = realShutter;
+}
+
+/*
+ * Raw frame capture (Lorite #171).
+ *
+ * Sources: the frame-mode register sequence is the one of Bitcraze's Arduino
+ * driver (bitcraze/Bitcraze_PMW3901, enableFrameBuffer() and readFrameBuffer(),
+ * commit 374d488). The pixel assembly follows Pimoroni's pmw3901-python
+ * frame_capture(): a byte tagged 01 in bits 7:6 holds pixel bits 7:2 in its
+ * bits 5:0, the next byte tagged 10 holds pixel bits 1:0 in its bits 3:2.
+ * (The Arduino driver adds those bits 3:2 without shifting them down, which
+ * corrupts the two low bits of every pixel.) Tags 00 and 11 mean "no data yet".
+ */
+
+// Register read with a configurable address-data delay (datasheet tSRAD = 35 us)
+// and the datasheet's 20 us read-to-next-command gap (tSRR). The motion driver's
+// registerRead() above waits 800 us per read, which would make one frame take 2 s.
+static uint8_t registerReadTimed(const deckPin_t csPin, uint8_t reg, uint32_t addrDataDelayUs)
+{
+  uint8_t data = 0;
+  uint8_t dummy = 0;
+
+  reg &= ~0x80u;
+
+  spiBeginTransaction(SPI_BAUDRATE_2MHZ);
+  digitalWrite(csPin, LOW);
+  sleepus(1);
+  spiExchange(1, &reg, &reg);
+  sleepus(addrDataDelayUs);
+  spiExchange(1, &dummy, &data);
+  digitalWrite(csPin, HIGH);
+  spiEndTransaction();
+  sleepus(20);
+
+  return data;
+}
+
+void pmw3901EnableFrameCapture(const deckPin_t csPin)
+{
+  registerWrite(csPin, 0x7F, 0x07);
+  registerWrite(csPin, 0x41, 0x1D);
+  registerWrite(csPin, 0x4C, 0x00);
+  registerWrite(csPin, 0x7F, 0x08);
+  registerWrite(csPin, 0x6A, 0x38);
+  registerWrite(csPin, 0x7F, 0x00);
+  registerWrite(csPin, 0x55, 0x04);
+  registerWrite(csPin, 0x40, 0x80);
+  registerWrite(csPin, 0x4D, 0x11);
+
+  // Pimoroni waits 10 ms here, Bitcraze's Arduino driver does not
+  vTaskDelay(M2T(10));
+
+  registerWrite(csPin, 0x70, 0x00);
+  registerWrite(csPin, 0x58, 0xFF);
+}
+
+bool pmw3901ReadFrame(const deckPin_t csPin, uint8_t *frame, uint32_t addrDataDelayUs,
+                      uint32_t timeoutUs, pmw3901FrameStats_t *stats)
+{
+  const uint64_t start = usecTimestamp();
+  stats->captureUs = 0;
+  stats->pixels = 0;
+  stats->invalidReads = 0;
+  stats->orderErrors = 0;
+
+  // Wait until the status bits leave 11 (busy), as the Arduino driver does
+  while ((registerReadTimed(csPin, 0x58, addrDataDelayUs) >> 6) == 0x03) {
+    if (usecTimestamp() - start > timeoutUs) {
+      stats->captureUs = (uint32_t)(usecTimestamp() - start);
+      return false;
+    }
+  }
+
+  uint16_t n = 0;
+  bool haveHigh = false;
+  uint8_t high = 0;
+  while (n < PMW3901_FRAME_PIXELS) {
+    const uint8_t value = registerReadTimed(csPin, 0x58, addrDataDelayUs);
+    const uint8_t tag = value >> 6;
+
+    if (tag == 0x01) {
+      if (haveHigh) {
+        stats->orderErrors++;
+      }
+      high = (uint8_t)((value & 0x3Fu) << 2);
+      haveHigh = true;
+    } else if (tag == 0x02) {
+      if (haveHigh) {
+        frame[n++] = high | (uint8_t)((value & 0x0Cu) >> 2);
+        haveHigh = false;
+      } else {
+        stats->orderErrors++;
+      }
+    } else {
+      stats->invalidReads++;
+    }
+
+    if (usecTimestamp() - start > timeoutUs) {
+      break;
+    }
+  }
+
+  stats->captureUs = (uint32_t)(usecTimestamp() - start);
+  stats->pixels = n;
+  return n == PMW3901_FRAME_PIXELS;
+}
+
+bool pmw3901Reinit(const deckPin_t csPin)
+{
+  if (!isInit) {
+    return false;
+  }
+
+  const uint8_t chipId    = registerRead(csPin, 0x00);
+  const uint8_t invChipId = registerRead(csPin, 0x5f);
+  if (chipId != 0x49 || invChipId != 0xB6) {
+    DEBUG_PRINT("Re-init: wrong chip id 0x%x:0x%x\n", chipId, invChipId);
+    return false;
+  }
+
+  powerOnResetAndConfigure(csPin);
+  return true;
 }

@@ -42,6 +42,10 @@ typedef enum {
   MEM_TYPE_LEDMEM   = 0x17,
   MEM_TYPE_APP      = 0x18,
   MEM_TYPE_DECK_MEM = 0x19,
+  // 0x1B is cflib's MemoryElement.TYPE_DECK_PAA3905 (a 35 x 35 image, Bitcraze
+  // branch flowdeck3). Lorite #171 serves PMW3901 frames under the same type,
+  // so cflib's PAA3905Memory reads them unchanged.
+  MEM_TYPE_FLOW_FRAME = 0x1B,
 } MemoryType_t;
 
 #define MEMORY_SERIAL_LENGTH 8

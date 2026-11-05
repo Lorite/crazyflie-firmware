@@ -74,4 +74,45 @@ bool pmw3901Init(const deckPin_t csPin);
 void pmw3901ReadMotion(const deckPin_t csPin, motionBurst_t * motion);
 
 
+
+/*
+ * Raw frame capture (Lorite #171). The PMW3901 can return one 35 x 35 frame
+ * of 8-bit pixels through register 0x58. While it is in frame mode it does not
+ * deliver motion, and the frame-mode writes overwrite motion-tuning registers,
+ * so the caller must call pmw3901Reinit() after a capture.
+ */
+#define PMW3901_FRAME_SIDE   35
+#define PMW3901_FRAME_PIXELS (PMW3901_FRAME_SIDE * PMW3901_FRAME_SIDE)
+
+typedef struct pmw3901FrameStats_s {
+  uint32_t captureUs;     // from the first status read to the last pixel
+  uint16_t pixels;        // pixels read, PMW3901_FRAME_PIXELS on success
+  uint16_t invalidReads;  // reads of 0x58 whose status bits held no pixel data
+  uint16_t orderErrors;   // a low-bits byte without a high-bits byte before it, or two high-bits bytes
+} pmw3901FrameStats_t;
+
+/**
+ * Switch the sensor into frame mode (Bitcraze's Arduino driver sequence,
+ * bitcraze/Bitcraze_PMW3901 enableFrameBuffer()).
+ */
+void pmw3901EnableFrameCapture(const deckPin_t csPin);
+
+/**
+ * Read one frame after pmw3901EnableFrameCapture().
+ *
+ * @param frame            PMW3901_FRAME_PIXELS bytes, row-major
+ * @param addrDataDelayUs  wait between the address byte and the data byte (tSRAD)
+ * @param timeoutUs        give up after this time
+ * @return true when all PMW3901_FRAME_PIXELS pixels were read
+ */
+bool pmw3901ReadFrame(const deckPin_t csPin, uint8_t *frame, uint32_t addrDataDelayUs,
+                      uint32_t timeoutUs, pmw3901FrameStats_t *stats);
+
+/**
+ * Power-on reset and the motion register set of pmw3901Init(), to return to
+ * motion mode after a frame capture.
+ * @return true when the chip id is right and the sensor was configured
+ */
+bool pmw3901Reinit(const deckPin_t csPin);
+
 #endif /* PMW3901_H_ */
