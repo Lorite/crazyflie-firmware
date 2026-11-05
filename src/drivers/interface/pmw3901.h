@@ -89,7 +89,30 @@ typedef struct pmw3901FrameStats_s {
   uint16_t pixels;        // pixels read, PMW3901_FRAME_PIXELS on success
   uint16_t invalidReads;  // reads of 0x58 whose status bits held no pixel data
   uint16_t orderErrors;   // a low-bits byte without a high-bits byte before it, or two high-bits bytes
+  // Diagnostics of the 0x58 reads (Lorite #171): the invalid reads split by value
+  uint16_t readsZero;     // 0x00
+  uint16_t readsFF;       // 0xFF
+  uint16_t readsTag00;    // tag 00 but not 0x00
+  uint16_t readsTag11;    // tag 11 but not 0xFF
+  uint8_t first[4];       // the first four raw 0x58 values after the wait
+  uint8_t status;         // the last status value of the wait (0x58 or 0x59)
 } pmw3901FrameStats_t;
+
+/**
+ * Frame-capture variant, set through the flowFrame parameters (Lorite #171).
+ * sequence 0: Pimoroni pmw3901-python frame_capture() (wait on 0x59, start the
+ * grab with 0x58 = 0x00). sequence 1: Bitcraze's Arduino enableFrameBuffer()
+ * and readFrameBuffer() (0x41 and 0x70 writes, wait on 0x58 while tag 11).
+ * csSetupUs and csHoldUs are the waits after chip select goes low and before
+ * it goes high in each frame read (the Arduino driver uses 50 and 100).
+ */
+typedef struct pmw3901FrameDiag_s {
+  uint8_t sequence;
+  uint8_t csSetupUs;
+  uint8_t csHoldUs;
+} pmw3901FrameDiag_t;
+
+extern pmw3901FrameDiag_t pmw3901FrameDiag;
 
 /**
  * Switch the sensor into frame mode (Bitcraze's Arduino driver sequence,

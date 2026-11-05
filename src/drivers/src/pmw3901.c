@@ -27,6 +27,8 @@
 #include "task.h"
 
 #include "pmw3901.h"
+
+#include <string.h>
 #include "deck.h"
 #include "debug.h"
 #include "system.h"
@@ -256,6 +258,8 @@ void pmw3901ReadMotion(const deckPin_t csPin, motionBurst_t * motion)
 // Register read with a configurable address-data delay (datasheet tSRAD = 35 us)
 // and the datasheet's 20 us read-to-next-command gap (tSRR). The motion driver's
 // registerRead() above waits 800 us per read, which would make one frame take 2 s.
+pmw3901FrameDiag_t pmw3901FrameDiag = {.sequence = 0, .csSetupUs = 1, .csHoldUs = 0};
+
 static uint8_t registerReadTimed(const deckPin_t csPin, uint8_t reg, uint32_t addrDataDelayUs)
 {
   uint8_t data = 0;
@@ -265,10 +269,13 @@ static uint8_t registerReadTimed(const deckPin_t csPin, uint8_t reg, uint32_t ad
 
   spiBeginTransaction(SPI_BAUDRATE_2MHZ);
   digitalWrite(csPin, LOW);
-  sleepus(1);
+  sleepus(pmw3901FrameDiag.csSetupUs);
   spiExchange(1, &reg, &reg);
   sleepus(addrDataDelayUs);
   spiExchange(1, &dummy, &data);
+  if (pmw3901FrameDiag.csHoldUs > 0) {
+    sleepus(pmw3901FrameDiag.csHoldUs);
+  }
   digitalWrite(csPin, HIGH);
   spiEndTransaction();
   sleepus(20);
@@ -282,6 +289,22 @@ void pmw3901EnableFrameCapture(const deckPin_t csPin)
   // Bitcraze's Arduino enableFrameBuffer() adds 0x41 = 0x1D and 0x70 = 0x00 and
   // never starts the grab: on crazylori_brushless_1 (2026-11-05) that sequence
   // returned no pixels in 3 s.
+  if (pmw3901FrameDiag.sequence == 1) {
+    // Bitcraze_PMW3901 enableFrameBuffer(), commit 374d488
+    registerWrite(csPin, 0x7F, 0x07);
+    registerWrite(csPin, 0x41, 0x1D);
+    registerWrite(csPin, 0x4C, 0x00);
+    registerWrite(csPin, 0x7F, 0x08);
+    registerWrite(csPin, 0x6A, 0x38);
+    registerWrite(csPin, 0x7F, 0x00);
+    registerWrite(csPin, 0x55, 0x04);
+    registerWrite(csPin, 0x40, 0x80);
+    registerWrite(csPin, 0x4D, 0x11);
+    registerWrite(csPin, 0x70, 0x00);
+    registerWrite(csPin, 0x58, 0xFF);
+    return;
+  }
+
   registerWrite(csPin, 0x7F, 0x07);
   registerWrite(csPin, 0x4C, 0x00);
   registerWrite(csPin, 0x7F, 0x08);
@@ -305,16 +328,36 @@ bool pmw3901ReadFrame(const deckPin_t csPin, uint8_t *frame, uint32_t addrDataDe
   stats->pixels = 0;
   stats->invalidReads = 0;
   stats->orderErrors = 0;
+  stats->readsZero = 0;
+  stats->readsFF = 0;
+  stats->readsTag00 = 0;
+  stats->readsTag11 = 0;
+  memset(stats->first, 0, sizeof(stats->first));
+  stats->status = 0;
 
-  // Wait until the raw-data grab status (0x59) reports ready, then start the
-  // grab by writing 0x00 to 0x58, as Pimoroni's driver does
-  while ((registerReadTimed(csPin, 0x59, addrDataDelayUs) & 0xC0u) == 0) {
-    if (usecTimestamp() - start > timeoutUs) {
-      stats->captureUs = (uint32_t)(usecTimestamp() - start);
-      return false;
-    }
+  if (pmw3901FrameDiag.sequence == 1) {
+    // Arduino driver: wait until the 0x58 status bits leave 11 (busy)
+    do {
+      stats->status = registerReadTimed(csPin, 0x58, addrDataDelayUs);
+      if (usecTimestamp() - start > timeoutUs) {
+        stats->captureUs = (uint32_t)(usecTimestamp() - start);
+        return false;
+      }
+    } while ((stats->status >> 6) == 0x03);
+  } else {
+    // Pimoroni driver: wait until the raw-data grab status (0x59) reports
+    // ready, then start the grab by writing 0x00 to 0x58
+    do {
+      stats->status = registerReadTimed(csPin, 0x59, addrDataDelayUs);
+      if (usecTimestamp() - start > timeoutUs) {
+        stats->captureUs = (uint32_t)(usecTimestamp() - start);
+        return false;
+      }
+    } while ((stats->status & 0xC0u) == 0);
+    registerWrite(csPin, 0x58, 0x00);
   }
-  registerWrite(csPin, 0x58, 0x00);
+
+  uint16_t reads = 0;
 
   uint16_t n = 0;
   bool haveHigh = false;
@@ -322,6 +365,10 @@ bool pmw3901ReadFrame(const deckPin_t csPin, uint8_t *frame, uint32_t addrDataDe
   while (n < PMW3901_FRAME_PIXELS) {
     const uint8_t value = registerReadTimed(csPin, 0x58, addrDataDelayUs);
     const uint8_t tag = value >> 6;
+    if (reads < sizeof(stats->first)) {
+      stats->first[reads] = value;
+    }
+    reads++;
 
     if (tag == 0x01) {
       if (haveHigh) {
@@ -338,6 +385,15 @@ bool pmw3901ReadFrame(const deckPin_t csPin, uint8_t *frame, uint32_t addrDataDe
       }
     } else {
       stats->invalidReads++;
+      if (value == 0x00) {
+        stats->readsZero++;
+      } else if (value == 0xFF) {
+        stats->readsFF++;
+      } else if (tag == 0x00) {
+        stats->readsTag00++;
+      } else {
+        stats->readsTag11++;
+      }
     }
 
     if (usecTimestamp() - start > timeoutUs) {

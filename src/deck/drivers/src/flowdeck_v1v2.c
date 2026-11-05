@@ -122,7 +122,7 @@ static bool frameMemRegistered = false;
 static uint8_t frameTrigger = 0;        // param: write 1 for one capture
 static uint16_t framePeriodMs = 0;      // param: > 0 captures periodically
 static uint8_t frameTsradUs = 50;       // param: Bitcraze's Arduino driver waits 50 us
-static uint16_t frameTimeoutMs = 3000;  // param
+static uint16_t frameTimeoutMs = 15000; // param: a frame takes 4 to 8.3 s on crazylori_brushless_1 (2026-11-05)
 static uint8_t frameAllowFlying = 0;    // param: 1 allows captures when armed or flying
 
 static uint16_t frameSeq = 0;           // log
@@ -131,6 +131,7 @@ static uint16_t frameCaptureMs = 0;     // log
 static uint16_t frameGapMs = 0;         // log
 static uint16_t frameInvalid = 0;       // log
 static uint16_t frameRefused = 0;       // log
+static pmw3901FrameStats_t frameDiagStats;  // log: the split of the invalid reads of the last capture
 static uint32_t lastFrameEndMs = 0;
 static bool discardNextMotion = false;
 
@@ -195,7 +196,7 @@ static void flowFrameCapture(void)
   flowFrame_t* frame = &frames[target];
 
   frame->startMs = T2M(xTaskGetTickCount());
-  frame->rangeMm = (uint16_t)(rangeGet(rangeDown) * 1000.0f);
+  frame->rangeMm = (uint16_t)rangeGet(rangeDown);  // rangeGet() returns mm, although rangeSet() takes m
   frame->tsradUs = frameTsradUs;
 
   const uint64_t start = usecTimestamp();
@@ -232,6 +233,7 @@ static void flowFrameCapture(void)
   frameCaptureMs = (uint16_t)(stats.captureUs / 1000u);
   frameGapMs = (uint16_t)(frame->gapUs / 1000u);
   frameInvalid = stats.invalidReads;
+  frameDiagStats = stats;
   lastFrameEndMs = T2M(xTaskGetTickCount());
   discardNextMotion = true;
 }
@@ -537,6 +539,37 @@ LOG_ADD(LOG_UINT16, invalid, &frameInvalid)
  * @brief Captures refused because the drone was armed or flying
  */
 LOG_ADD(LOG_UINT16, refused, &frameRefused)
+/**
+ * @brief Diagnostics of the last capture: invalid reads equal to 0x00
+ */
+LOG_ADD(LOG_UINT16, nZero, &frameDiagStats.readsZero)
+/**
+ * @brief Invalid reads equal to 0xFF
+ */
+LOG_ADD(LOG_UINT16, nFF, &frameDiagStats.readsFF)
+/**
+ * @brief Invalid reads with tag 00 that are not 0x00
+ */
+LOG_ADD(LOG_UINT16, nTag00, &frameDiagStats.readsTag00)
+/**
+ * @brief Invalid reads with tag 11 that are not 0xFF
+ */
+LOG_ADD(LOG_UINT16, nTag11, &frameDiagStats.readsTag11)
+/**
+ * @brief Pixels read before the capture ended
+ */
+LOG_ADD(LOG_UINT16, pixels, &frameDiagStats.pixels)
+/**
+ * @brief The last status value of the wait before the pixel reads
+ */
+LOG_ADD(LOG_UINT8, status, &frameDiagStats.status)
+/**
+ * @brief First raw 0x58 value after the wait (raw1 to raw3 follow)
+ */
+LOG_ADD(LOG_UINT8, raw0, &frameDiagStats.first[0])
+LOG_ADD(LOG_UINT8, raw1, &frameDiagStats.first[1])
+LOG_ADD(LOG_UINT8, raw2, &frameDiagStats.first[2])
+LOG_ADD(LOG_UINT8, raw3, &frameDiagStats.first[3])
 LOG_GROUP_STOP(flowFrame)
 
 /**
@@ -563,4 +596,16 @@ PARAM_ADD(PARAM_UINT16, timeoutMs, &frameTimeoutMs)
  * @brief 1 allows captures while armed or flying (the EKF then gets no flow for flowFrame.gapMs)
  */
 PARAM_ADD(PARAM_UINT8, allowFlying, &frameAllowFlying)
+/**
+ * @brief Frame-grab sequence: 0 Pimoroni (default), 1 Bitcraze Arduino driver
+ */
+PARAM_ADD(PARAM_UINT8, sequence, &pmw3901FrameDiag.sequence)
+/**
+ * @brief Wait after chip select goes low in each frame read [us] (default 1, Arduino 50)
+ */
+PARAM_ADD(PARAM_UINT8, csSetupUs, &pmw3901FrameDiag.csSetupUs)
+/**
+ * @brief Wait before chip select goes high in each frame read [us] (default 0, Arduino 100)
+ */
+PARAM_ADD(PARAM_UINT8, csHoldUs, &pmw3901FrameDiag.csHoldUs)
 PARAM_GROUP_STOP(flowFrame)
