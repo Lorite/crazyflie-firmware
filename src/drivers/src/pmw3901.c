@@ -278,8 +278,11 @@ static uint8_t registerReadTimed(const deckPin_t csPin, uint8_t reg, uint32_t ad
 
 void pmw3901EnableFrameCapture(const deckPin_t csPin)
 {
+  // The frame-grab sequence of Pimoroni's pmw3901-python frame_capture().
+  // Bitcraze's Arduino enableFrameBuffer() adds 0x41 = 0x1D and 0x70 = 0x00 and
+  // never starts the grab: on crazylori_brushless_1 (2026-11-05) that sequence
+  // returned no pixels in 3 s.
   registerWrite(csPin, 0x7F, 0x07);
-  registerWrite(csPin, 0x41, 0x1D);
   registerWrite(csPin, 0x4C, 0x00);
   registerWrite(csPin, 0x7F, 0x08);
   registerWrite(csPin, 0x6A, 0x38);
@@ -288,10 +291,9 @@ void pmw3901EnableFrameCapture(const deckPin_t csPin)
   registerWrite(csPin, 0x40, 0x80);
   registerWrite(csPin, 0x4D, 0x11);
 
-  // Pimoroni waits 10 ms here, Bitcraze's Arduino driver does not
   vTaskDelay(M2T(10));
 
-  registerWrite(csPin, 0x70, 0x00);
+  registerWrite(csPin, 0x7F, 0x00);
   registerWrite(csPin, 0x58, 0xFF);
 }
 
@@ -304,13 +306,15 @@ bool pmw3901ReadFrame(const deckPin_t csPin, uint8_t *frame, uint32_t addrDataDe
   stats->invalidReads = 0;
   stats->orderErrors = 0;
 
-  // Wait until the status bits leave 11 (busy), as the Arduino driver does
-  while ((registerReadTimed(csPin, 0x58, addrDataDelayUs) >> 6) == 0x03) {
+  // Wait until the raw-data grab status (0x59) reports ready, then start the
+  // grab by writing 0x00 to 0x58, as Pimoroni's driver does
+  while ((registerReadTimed(csPin, 0x59, addrDataDelayUs) & 0xC0u) == 0) {
     if (usecTimestamp() - start > timeoutUs) {
       stats->captureUs = (uint32_t)(usecTimestamp() - start);
       return false;
     }
   }
+  registerWrite(csPin, 0x58, 0x00);
 
   uint16_t n = 0;
   bool haveHigh = false;

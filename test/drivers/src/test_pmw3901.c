@@ -23,6 +23,7 @@ static uint8_t stream[MAX_STREAM];   // what reads of 0x58 return, in order
 static int streamLen;
 static int streamPos;
 static uint8_t streamTail;           // returned once the stream is used up
+static int grabNotReady;             // reads of 0x59 that report not ready before it reports ready
 
 static uint8_t writeReg[MAX_WRITES];
 static uint8_t writeVal[MAX_WRITES];
@@ -59,6 +60,13 @@ static bool spiExchangeCallback(size_t length, const uint8_t *data_tx, uint8_t *
     data_rx[0] = 0x49;  // chip id
   } else if (currentReg == 0x5F) {
     data_rx[0] = 0xB6;  // inverse chip id
+  } else if (currentReg == 0x59) {
+    if (grabNotReady > 0) {
+      grabNotReady--;
+      data_rx[0] = 0x00;
+    } else {
+      data_rx[0] = 0xC0;
+    }
   } else if (currentReg == 0x58) {
     data_rx[0] = (streamPos < streamLen) ? stream[streamPos++] : streamTail;
   } else {
@@ -93,6 +101,7 @@ void setUp(void)
   streamLen = 0;
   streamPos = 0;
   streamTail = 0x00;
+  grabNotReady = 0;
   nWrites = 0;
   expectData = false;
   fakeTimeUs = 0;
@@ -119,11 +128,11 @@ void testThatReinitFailsBeforeInit()
   TEST_ASSERT_EQUAL(0, nWrites);
 }
 
-void testThatEnableFrameCaptureWritesTheArduinoDriverSequence()
+void testThatEnableFrameCaptureWritesThePimoroniSequence()
 {
-  // Bitcraze_PMW3901 enableFrameBuffer(), commit 374d488
-  const uint8_t expectedReg[] = {0x7F, 0x41, 0x4C, 0x7F, 0x6A, 0x7F, 0x55, 0x40, 0x4D, 0x70, 0x58};
-  const uint8_t expectedVal[] = {0x07, 0x1D, 0x00, 0x08, 0x38, 0x00, 0x04, 0x80, 0x11, 0x00, 0xFF};
+  // pimoroni/pmw3901-python frame_capture()
+  const uint8_t expectedReg[] = {0x7F, 0x4C, 0x7F, 0x6A, 0x7F, 0x55, 0x40, 0x4D, 0x7F, 0x58};
+  const uint8_t expectedVal[] = {0x07, 0x00, 0x08, 0x38, 0x00, 0x04, 0x80, 0x11, 0x00, 0xFF};
 
   pmw3901EnableFrameCapture(TEST_CS_PIN);
 
@@ -134,10 +143,8 @@ void testThatEnableFrameCaptureWritesTheArduinoDriverSequence()
 
 void testThatReadFrameAssemblesEveryPixelAndSkipsInvalidReads()
 {
-  push(0xC0);  // busy (tag 11) twice before the frame starts
-  push(0xC0);
-  push(0x00);  // first status read that is not busy
-  int invalid = 1;
+  grabNotReady = 2;  // the grab status reports not ready twice
+  int invalid = 0;
   for (int i = 0; i < PMW3901_FRAME_PIXELS; i++) {
     if (i % 5 == 0) {
       push(0x00);  // no data yet
@@ -160,8 +167,11 @@ void testThatReadFrameAssemblesEveryPixelAndSkipsInvalidReads()
   TEST_ASSERT_TRUE(ok);
   TEST_ASSERT_EQUAL(PMW3901_FRAME_PIXELS, stats.pixels);
   TEST_ASSERT_EQUAL_UINT8_ARRAY(truth, frame, PMW3901_FRAME_PIXELS);
-  // The 0x00 after the two busy reads ends the wait, so it is not counted
-  TEST_ASSERT_EQUAL(invalid - 1, stats.invalidReads);
+  TEST_ASSERT_EQUAL(invalid, stats.invalidReads);
+  // The grab starts with one write of 0x00 to 0x58
+  TEST_ASSERT_EQUAL(1, nWrites);
+  TEST_ASSERT_EQUAL(0x58, writeReg[0]);
+  TEST_ASSERT_EQUAL(0x00, writeVal[0]);
   TEST_ASSERT_EQUAL(0, stats.orderErrors);
 }
 
@@ -169,7 +179,6 @@ void testThatTheLowTwoBitsAreKept()
 {
   // Pixels whose value depends only on the low two bits. The Arduino formula
   // (a << 2) + (b & 0x0C) gets these wrong, the Pimoroni formula gets them right.
-  push(0x00);
   const uint8_t values[] = {0x00, 0x01, 0x02, 0x03, 0xFC, 0xFD, 0xFE, 0xFF};
   for (int i = 0; i < PMW3901_FRAME_PIXELS; i++) {
     truth[i] = values[i % sizeof(values)];
@@ -184,7 +193,6 @@ void testThatTheLowTwoBitsAreKept()
 
 void testThatOrderErrorsAreCountedAndDoNotShiftTheFrame()
 {
-  push(0x00);
   push(0x80);         // a low half without a high half: ignored, counted
   push(0x40 | 0x3F);  // a high half that is overwritten by the next one: counted
   for (int i = 0; i < PMW3901_FRAME_PIXELS; i++) {
@@ -200,7 +208,6 @@ void testThatOrderErrorsAreCountedAndDoNotShiftTheFrame()
 
 void testThatReadFrameTimesOutWhenNoPixelsArrive()
 {
-  push(0x00);
   streamTail = 0x00;  // never any data
 
   uint8_t frame[PMW3901_FRAME_PIXELS];
@@ -213,9 +220,9 @@ void testThatReadFrameTimesOutWhenNoPixelsArrive()
   TEST_ASSERT_TRUE(stats.captureUs < 6000);
 }
 
-void testThatReadFrameTimesOutWhileTheSensorStaysBusy()
+void testThatReadFrameTimesOutWhileTheGrabIsNotReady()
 {
-  streamTail = 0xC0;
+  grabNotReady = 1 << 30;
 
   uint8_t frame[PMW3901_FRAME_PIXELS];
   pmw3901FrameStats_t stats;
