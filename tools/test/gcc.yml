@@ -41,7 +41,7 @@ compiler:
       - 'vendor/FreeRTOS/include/'
       - 'src/config/'
       - 'src/drivers/interface/'
-      - 'src/drivers/src'
+      - 'src/drivers/src/'
       - 'src/drivers/esp32/interface/'
       - 'src/drivers/esp32/src/'
       - 'src/hal/interface/'
